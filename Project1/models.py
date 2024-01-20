@@ -3,7 +3,7 @@
 from sentiment_data import Counter, List
 import torch
 import torch.nn as nn
-from torch import optim
+from torch import optim  
 import numpy as np
 import random
 from typing import List
@@ -12,6 +12,9 @@ from utils import *
 from collections import Counter
 import tqdm
 from nltk.corpus import stopwords
+
+
+stop_words = set(stopwords.words('english'))
 
 
 class SentimentClassifier(object):
@@ -77,7 +80,7 @@ class UnigramFeatureExtractor(FeatureExtractor):
     """
     def __init__(self, indexer: Indexer):
         self.indexer = indexer
-        self.stop_words = set(stopwords.words('english'))
+        self.stop_words = stop_words
 
     def get_indexer(self):
         return self.indexer
@@ -89,7 +92,7 @@ class UnigramFeatureExtractor(FeatureExtractor):
                 idx = self.indexer.add_and_get_index(word, add_to_indexer)
                 counter[idx] += 1
         return counter
-    
+
     """
     Returns preprocessed unigram token and returns None if token is not a valid feature.
     Only stop words are considered invalid at this time. 
@@ -105,7 +108,26 @@ class BigramFeatureExtractor(FeatureExtractor):
     """
 
     def __init__(self, indexer: Indexer):
-        raise Exception("Must be implemented")
+        self.indexer = indexer
+        self.stop_words = set(stopwords.words('english'))
+
+    def get_indexer(self):
+        return self.indexer
+    
+    def extract_features(self, sentence: List[str], add_to_indexer: bool = False) -> Counter:
+        counter = Counter()
+        sentence = list(filter(lambda token: token != None, map(
+                lambda token: self.process_unigram(token), 
+                sentence
+        )))
+        for i in range(len(sentence) - 1):
+            idx = self.indexer.add_and_get_index(frozenset((sentence[i], sentence[i + 1])), add_to_indexer)
+            counter[idx] += 1
+        return counter
+    
+    def process_unigram(self, word: str) -> str:
+        result = word.lower()
+        return result if result not in self.stop_words else None
 
 
 class BetterFeatureExtractor(FeatureExtractor):
@@ -147,17 +169,17 @@ def train_logistic_regression(train_exs: List[SentimentExample], feat_extractor:
     :return: trained LogisticRegressionClassifier model
     """
     # random.seed(1)
-    num_epochs = 15
+    num_epochs = 10
     num_samples = len(train_exs)
     step_size = 0.1
     tau = 2
-    schedule_rate = 0
+    schedule_rate = 2
     feature_vectors: List[Counter] = [feat_extractor.extract_features(sample.words, True) for sample in train_exs]
     indexer: Indexer = feat_extractor.get_indexer()
     vocab_size = len(indexer)
 
     #zero weight initialization
-    weights = np.zeros((vocab_size))
+    weights = np.zeros(vocab_size)
 
     for epoch in tqdm.tqdm(range(num_epochs)):
         sample_order = list(range(num_samples))
@@ -212,13 +234,54 @@ def train_linear_model(args, train_exs: List[SentimentExample], dev_exs: List[Se
     return model
 
 
+class SentimentClassifierNN(nn.Module):
+    def __init__(self, embedding_layer, inp, hid, out):
+        super(SentimentClassifierNN, self).__init__()
+        self.embedding_layer = embedding_layer
+        self.V = nn.Linear(inp, hid)
+        self.g = nn.ReLU()
+        self.W = nn.Linear(hid, out)
+        self.softmax = nn.LogSoftmax(dim=0)
+
+        nn.init.xavier_uniform_(self.V.weight)
+        nn.init.xavier_uniform_(self.W.weight)
+    
+    #x: list of indices that can be converted into an embedding
+    def forward(self, x_indices):
+        x = torch.sum(self.embedding_layer(x_indices), 0)
+        x /= len(x_indices)
+        return self.softmax(self.W(self.g(self.V(x))))
+    
+
+def process_token(word: str) -> str:
+    result = word.lower()
+    return result if result not in stop_words else None
+
 class NeuralSentimentClassifier(SentimentClassifier):
     """
     Implement your NeuralSentimentClassifier here. This should wrap an instance of the network with learned weights
     along with everything needed to run it on new data (word embeddings, etc.)
     """
     def __init__(self, network, word_embeddings):
-        raise NotImplementedError
+
+        self.model = network
+        self.word_embeddings = word_embeddings
+
+    def predict(self, ex_words: List[str]) -> int: 
+        x = torch.zeros(1, self.word_embeddings.get_embedding_length()).float()
+        tokens = list(filter(lambda token: token != None, map(
+                lambda token: process_token(token), 
+                ex_words
+            )))   
+        for token in tokens:
+            x += self.word_embeddings.get_embedding(token)
+        x /= max(len(tokens), 1) #avoid divide by zero 
+        y_hat = self.model.forward(x)
+        return torch.argmax(y_hat)
+    
+    def predict_all(self, all_ex_words: List[List[str]]) -> List[int]:
+        return super().predict_all(all_ex_words)
+    
 
 
 def train_deep_averaging_network(args, train_exs: List[SentimentExample], dev_exs: List[SentimentExample], word_embeddings: WordEmbeddings) -> NeuralSentimentClassifier:
@@ -230,4 +293,57 @@ def train_deep_averaging_network(args, train_exs: List[SentimentExample], dev_ex
     :param word_embeddings: set of loaded word embeddings
     :return: A trained NeuralSentimentClassifier model
     """
-    raise NotImplementedError
+    
+    num_samples = len(train_exs)
+    embeddings: nn.Embedding = word_embeddings.get_initialized_embedding_layer(frozen=True)
+    indexer = word_embeddings.word_indexer
+    print("Num Samples: ", num_samples)
+    num_epochs = 50
+    num_classes = 2
+    hid = 60
+    input_dim = word_embeddings.get_embedding_length()
+    #Create input vectors
+    loss_function = torch.nn.CrossEntropyLoss()
+    x = []
+    labels = torch.zeros(num_samples)
+    for idx in range(num_samples):
+        sample = train_exs[idx]
+        tokens = list(filter(lambda token: token != None, map(
+                lambda token: process_token(token), 
+                sample.words
+            )))        
+        token_indices = set() 
+        for token in tokens:
+            if indexer.contains(token):
+                token_indices.add(indexer.index_of(token))
+        x.append(torch.tensor(list(token_indices)))
+        labels[idx] = sample.label
+
+
+    model = SentimentClassifierNN(embeddings, input_dim, hid, num_classes)
+    initial_learning_rate = 0.01
+    optimizer = optim.Adam(model.parameters(), lr=initial_learning_rate)
+
+    for epoch in range(num_epochs):
+        sample_order = list(range(num_samples))
+        random.shuffle(sample_order)
+        total_loss = 0.0
+
+        for idx in sample_order:
+            y = labels[idx]
+            y_onehot = torch.zeros(num_classes)
+            y_onehot.scatter_(0, torch.from_numpy(np.asarray(y, dtype=np.int64)), 1)
+
+            model.zero_grad()
+            y_hat = model.forward(x[idx])
+
+            loss = loss_function(y_hat, y_onehot)
+            total_loss += loss
+
+            loss.backward()
+            optimizer.step()
+        if not epoch % 10:
+            print("Total loss on epoch %i: %f" % (epoch, total_loss))
+
+    classifier = NeuralSentimentClassifier(model, word_embeddings)
+    return classifier
