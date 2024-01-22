@@ -171,8 +171,8 @@ def train_logistic_regression(train_exs: List[SentimentExample], feat_extractor:
     # random.seed(1)
     num_epochs = 10
     num_samples = len(train_exs)
-    step_size = 0.1
-    tau = 2
+    step_size = 0.01
+    tau = 1
     schedule_rate = 2
     feature_vectors: List[Counter] = [feat_extractor.extract_features(sample.words, True) for sample in train_exs]
     indexer: Indexer = feat_extractor.get_indexer()
@@ -238,19 +238,24 @@ class SentimentClassifierNN(nn.Module):
     def __init__(self, embedding_layer, inp, hid, out):
         super(SentimentClassifierNN, self).__init__()
         self.embedding_layer = embedding_layer
-        self.V = nn.Linear(inp, hid)
-        self.g = nn.ReLU()
-        self.W = nn.Linear(hid, out)
-        self.softmax = nn.LogSoftmax(dim=0)
+        linear_1 = nn.Linear(inp, hid)
+        linear_out = nn.Linear(hid, out)
+        nn.init.xavier_uniform_(linear_1.weight)
+        nn.init.xavier_uniform_(linear_out.weight)
 
-        nn.init.xavier_uniform_(self.V.weight)
-        nn.init.xavier_uniform_(self.W.weight)
+
+        self.linear = nn.Sequential(
+            linear_1, 
+            nn.ReLU(),
+            linear_out, 
+            nn.LogSoftmax(dim=0)
+        )
     
     #x: list of indices that can be converted into an embedding
     def forward(self, x_indices):
         x = torch.sum(self.embedding_layer(x_indices), 0)
         x /= len(x_indices)
-        return self.softmax(self.W(self.g(self.V(x))))
+        return self.linear(x)
     
 
 def process_token(word: str) -> str:
@@ -266,16 +271,19 @@ class NeuralSentimentClassifier(SentimentClassifier):
 
         self.model = network
         self.word_embeddings = word_embeddings
-
+        self.indexer = self.word_embeddings.word_indexer
     def predict(self, ex_words: List[str]) -> int: 
         x = torch.zeros(1, self.word_embeddings.get_embedding_length()).float()
         tokens = list(filter(lambda token: token != None, map(
                 lambda token: process_token(token), 
                 ex_words
-            )))   
+            )))
+        token_indices = set()
         for token in tokens:
-            x += self.word_embeddings.get_embedding(token)
-        x /= max(len(tokens), 1) #avoid divide by zero 
+            if self.indexer.contains(token):
+                token_indices.add(self.indexer.index_of(token))
+        
+        x = torch.tensor(list(token_indices), dtype=torch.long)
         y_hat = self.model.forward(x)
         return torch.argmax(y_hat)
     
@@ -298,7 +306,7 @@ def train_deep_averaging_network(args, train_exs: List[SentimentExample], dev_ex
     embeddings: nn.Embedding = word_embeddings.get_initialized_embedding_layer(frozen=True)
     indexer = word_embeddings.word_indexer
     print("Num Samples: ", num_samples)
-    num_epochs = 50
+    num_epochs = 6
     num_classes = 2
     hid = 60
     input_dim = word_embeddings.get_embedding_length()
@@ -321,7 +329,7 @@ def train_deep_averaging_network(args, train_exs: List[SentimentExample], dev_ex
 
 
     model = SentimentClassifierNN(embeddings, input_dim, hid, num_classes)
-    initial_learning_rate = 0.01
+    initial_learning_rate = 0.0005
     optimizer = optim.Adam(model.parameters(), lr=initial_learning_rate)
 
     for epoch in range(num_epochs):
@@ -342,8 +350,8 @@ def train_deep_averaging_network(args, train_exs: List[SentimentExample], dev_ex
 
             loss.backward()
             optimizer.step()
-        if not epoch % 10:
-            print("Total loss on epoch %i: %f" % (epoch, total_loss))
+        if not epoch % 1:
+            print("Average Loss on epoch %i: %f" % (epoch, total_loss/num_samples))
 
     classifier = NeuralSentimentClassifier(model, word_embeddings)
     return classifier
